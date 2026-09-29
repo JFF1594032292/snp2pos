@@ -4,6 +4,8 @@ English | [简体中文](README.zh-CN.md)
 
 Query rsIDs and genomic positions using a local dbSNP database and tabix.
 
+Designed for quick annotation of small to medium SNP lists, such as candidate variants or GWAS lead SNPs. In the author’s usage, throughput is on the order of a few hundred SNPs per second. Indexed lookups avoid scanning the full database, so query speed is generally less sensitive to total database size than a full-file scan. Actual throughput depends on storage, caching, and query size and distribution; this is an indicative rate, not a benchmark guarantee. The tool is not optimized for annotating millions of SNPs in a single run.
+
 - `snp2pos`: convert rsIDs to genomic positions.
 - `pos2snp`: find rsIDs at genomic positions.
 - `vcf2rs_chrall`: build a lookup table indexed by numeric rsID from a VCF.
