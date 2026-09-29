@@ -1,0 +1,7 @@
+[37]
+# pos2snp = /path/to/GRCh37.vcf.gz
+# snp2pos = /path/to/GRCh37_rs.gz
+
+[38]
+# pos2snp = /path/to/GRCh38.vcf.gz
+# snp2pos = /path/to/GRCh38_rs.gz

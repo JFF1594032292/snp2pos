@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+/data/
+*.gz
+*.csi
+*.tbi
+!examples/*.gz
+!examples/*.csi
+.snp2pos_config

@@ -1,0 +1,157 @@
+#!/usr/bin/env python3
+# coding=utf-8
+
+import argparse
+import gzip
+import os
+import re
+import subprocess
+import sys
+import time
+
+
+RS_RE = re.compile(r"(?:^|[;,])rs([0-9]+)(?=$|[;,])")
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        description=(
+            "Convert dbSNP VCF(.gz) to rs lookup table: "
+            "rs\\tRS_NUMBER\\tCHR:POS\\tREF\\tALT, then bgzip and CSI-index it."
+        )
+    )
+    parser.add_argument("vcf", help="Input dbSNP VCF .gz file.")
+    parser.add_argument("-o", "--output", help="Output *_rs-chrall.gz file.", required=True)
+    parser.add_argument("-f", "--force", help="Overwrite existing output/index.", action="store_true")
+    parser.add_argument("--no-index", help="Do not create .csi index.", action="store_true")
+    parser.add_argument("-t", "--time", help="Show time spent, T or F, default F", required=False, type=str, default="F")
+    return parser
+
+
+def require_command(name):
+    try:
+        subprocess.run([name, "--help"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except FileNotFoundError:
+        sys.stderr.write("Error: %s was not found in PATH.\n" % name)
+        sys.exit(1)
+
+
+def open_vcf(path):
+    if path.endswith(".gz"):
+        return gzip.open(path, "rt", encoding="utf-8")
+    return open(path, "r", encoding="utf-8")
+
+
+def iter_rs_records(vcf_path):
+    with open_vcf(vcf_path) as fh:
+        for line in fh:
+            if not line or line.startswith("#"):
+                continue
+            fields = line.rstrip("\n").split("\t")
+            if len(fields) < 5:
+                continue
+            chrom, pos, variant_id, ref, alt = fields[:5]
+            for rs_number in RS_RE.findall(variant_id):
+                yield "rs\t%s\t%s:%s\t%s\t%s\n" % (rs_number, chrom, pos, ref, alt)
+
+
+def convert_vcf(vcf_path, output_path, force):
+    if os.path.exists(output_path) and not force:
+        sys.stderr.write("Error: output exists, use -f to overwrite: %s\n" % output_path)
+        sys.exit(1)
+
+    sort_proc = None
+    bgzip_proc = None
+    count = 0
+
+    try:
+        with open(output_path, "wb") as output_fh:
+            sort_proc = subprocess.Popen(
+                ["sort", "-t", "\t", "-k2,2n"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            bgzip_proc = subprocess.Popen(
+                ["bgzip", "-c"],
+                stdin=sort_proc.stdout,
+                stdout=output_fh,
+                stderr=subprocess.PIPE,
+            )
+            sort_proc.stdout.close()
+
+            for record in iter_rs_records(vcf_path):
+                sort_proc.stdin.write(record)
+                count += 1
+            sort_proc.stdin.close()
+
+            sort_stderr = sort_proc.stderr.read()
+            bgzip_stderr = bgzip_proc.stderr.read()
+            sort_return = sort_proc.wait()
+            bgzip_return = bgzip_proc.wait()
+
+        if sort_return != 0:
+            sys.stderr.write("Error: sort failed.\n")
+            if sort_stderr:
+                sys.stderr.write(sort_stderr)
+            sys.exit(sort_return)
+        if bgzip_return != 0:
+            sys.stderr.write("Error: bgzip failed.\n")
+            if bgzip_stderr:
+                sys.stderr.write(bgzip_stderr.decode("utf-8", errors="replace"))
+            sys.exit(bgzip_return)
+    except Exception:
+        if sort_proc is not None and sort_proc.poll() is None:
+            sort_proc.kill()
+        if bgzip_proc is not None and bgzip_proc.poll() is None:
+            bgzip_proc.kill()
+        raise
+
+    return count
+
+
+def index_output(output_path):
+    proc = subprocess.run(
+        ["tabix", "-f", "-C", "-s", "1", "-b", "2", "-e", "2", output_path],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if proc.returncode != 0:
+        sys.stderr.write("Error: tabix indexing failed.\n")
+        if proc.stderr:
+            sys.stderr.write(proc.stderr)
+        sys.exit(proc.returncode)
+
+
+def chmod_readable(path):
+    try:
+        os.chmod(path, 0o644)
+    except FileNotFoundError:
+        pass
+
+
+def main():
+    t1 = time.time()
+    args = build_parser().parse_args()
+
+    require_command("sort")
+    require_command("bgzip")
+    if not args.no_index:
+        require_command("tabix")
+
+    count = convert_vcf(args.vcf, args.output, args.force)
+    chmod_readable(args.output)
+    if not args.no_index:
+        index_output(args.output)
+        chmod_readable(args.output + ".csi")
+
+    sys.stderr.write("Wrote %s records to %s\n" % (count, args.output))
+    if args.time == "T":
+        t2 = time.time()
+        sys.stderr.write("Take time: %ss\n" % str(t2 - t1))
+
+
+if __name__ == "__main__":
+    main()

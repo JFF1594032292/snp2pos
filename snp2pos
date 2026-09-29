@@ -1,0 +1,194 @@
+#!/usr/bin/env python3
+# coding=utf-8
+
+import argparse
+import os
+import subprocess
+import sys
+import tempfile
+import time
+
+
+SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, SCRIPT_DIR)
+from snp2pos_config import database_path, save_database, configparser
+
+DEFAULT_DBSNP_BY_GRCH = {
+    "37": os.path.join(SCRIPT_DIR, "GCF_000001405.25_rs-chrall.gz"),
+    "38": os.path.join(SCRIPT_DIR, "GCF_000001405.38_rs-chrall.gz"),
+}
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        description=(
+            "Annotate rs to pos: CHR\\tPOS\\tSNP\\tREF\\tALT (POS is 1-based), or BED format: "
+            "CHR\\tPOS-1\\tPOS+1\\tSNP (0-based, end-exclusive, 2 bp interval). "
+            ""
+        )
+    )
+    parser.add_argument('-rs', '--RS_number', help="Input a rs number in 1 line.", type=str, required=False)
+    parser.add_argument('file', help="Input a file or stdin. A list of SNPs", type=argparse.FileType('r'), nargs='?', default=sys.stdin)
+    parser.add_argument('-o', '--output', help="Output file.", type=argparse.FileType('w'), nargs='?', default=sys.stdout)
+    parser.add_argument('-g', '--GRCh', help="GRCh38 or GRCh37, default 37", required=False, type=str, default="37", choices=["37", "38"])
+    parser.add_argument('-t', '--time', help="Show time spent, T or F, default F", required=False, type=str, default="F")
+    parser.add_argument('-s', '--split', help="Split multiple alleles into different lines, default F", required=False, type=str, default="F")
+    parser.add_argument('-bed', '--bedout', help="T: 0-based, end-exclusive BED [POS-1, POS+1), spanning 2 bp; F: 1-based POS (default).", required=False, type=str, default="F")
+    parser.add_argument('-prefix', '--prefix_chr', help="Prefix before chr, default chr only number", required=False, type=str, default="")
+    parser.add_argument('--dbsnp', help="Use this tabix-indexed rs lookup file instead of default dbSNP path.", type=str, required=False)
+    parser.add_argument("--set-dbsnp", metavar="PATH", help="Save database path for -g in installation .snp2pos_config and exit.")
+    return parser
+
+
+def resolve_dbsnp(grch, user_path):
+    return database_path("snp2pos", grch, user_path, DEFAULT_DBSNP_BY_GRCH[grch])
+
+
+def parse_rs_number(value):
+    """Return numeric part of rsID as a string; return None for invalid input."""
+    if value is None:
+        return None
+    value = str(value).strip()
+    if not value:
+        return None
+
+    # 保持原脚本习惯：允许输入 rs123 或 123。额外兼容 RS123。
+    if value[:2].lower() == "rs":
+        value = value[2:]
+
+    if not value.isdigit():
+        return None
+    return value
+
+
+def run_tabix(cmd):
+    """Run tabix safely and return stdout lines."""
+    try:
+        proc = subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except FileNotFoundError:
+        sys.stderr.write("Error: tabix was not found in PATH.\n")
+        sys.exit(1)
+
+    if proc.returncode != 0:
+        sys.stderr.write("Error: tabix failed.\n")
+        sys.stderr.write("Command: %s\n" % " ".join(cmd))
+        if proc.stderr:
+            sys.stderr.write(proc.stderr)
+            if not proc.stderr.endswith("\n"):
+                sys.stderr.write("\n")
+        sys.exit(proc.returncode)
+
+    return proc.stdout.splitlines()
+
+
+def snp2bed_one(rs_value, dbsnp):
+    number = parse_rs_number(rs_value)
+    if number is None:
+        return []
+
+    region = "rs:%s-%s" % (number, number)
+    result = []
+    for line in run_tabix(["tabix", dbsnp, region]):
+        fields = line.rstrip("\n").split("\t")
+        if len(fields) >= 5 and fields[1] == number:
+            result.append("\t".join(fields[:5]))
+    return result
+
+
+def file2bed_tabix(file_obj, dbsnp):
+    # 与原脚本行为一致：去重后按 rs 数字升序查询和输出。
+    query_set = set()
+    for line in file_obj:
+        number = parse_rs_number(line)
+        if number is not None:
+            query_set.add(number)
+
+    if not query_set:
+        return []
+
+    sorted_numbers = sorted(query_set, key=int)
+
+    temp_path = None
+    try:
+        # 使用系统临时目录，避免输入文件是绝对路径时导致临时文件路径异常。
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            prefix="snp2pos_",
+            suffix=".regions",
+            delete=False,
+        ) as temp_fh:
+            temp_path = temp_fh.name
+            for number in sorted_numbers:
+                # tabix -R 的非 BED 文件使用三列、1-based 闭区间。
+                temp_fh.write("rs\t%s\t%s\n" % (number, number))
+
+        result = []
+        for line in run_tabix(["tabix", dbsnp, "-R", temp_path]):
+            fields = line.rstrip("\n").split("\t")
+            if len(fields) >= 5 and fields[1] in query_set:
+                result.append("\t".join(fields[:5]))
+        return result
+    finally:
+        if temp_path is not None:
+            try:
+                os.remove(temp_path)
+            except FileNotFoundError:
+                pass
+
+
+def write_record(record, output, prefix, bed_out, split_allele):
+    fields = record.strip().split("\t")
+    if len(fields) < 5:
+        return
+
+    chrom_pos = fields[2].split(":", 1)
+    if len(chrom_pos) != 2:
+        return
+
+    chrom = prefix + chrom_pos[0]
+    pos = chrom_pos[1]
+    snp_id = fields[0] + fields[1]
+    ref = fields[3]
+    alt = fields[4]
+
+    if bed_out == "F":
+        if split_allele == "F":
+            output.write("\t".join([chrom, pos, snp_id, ref, alt]) + "\n")
+        elif split_allele == "T":
+            for allele in alt.split(","):
+                output.write("\t".join([chrom, pos, snp_id, ref, allele]) + "\n")
+    elif bed_out == "T":
+        output.write("\t".join([chrom, str(int(pos) - 1), str(int(pos) + 1), snp_id]) + "\n")
+
+
+def main():
+    t1 = time.time()
+    parser = build_parser()
+    args = parser.parse_args()
+    try:
+        if args.set_dbsnp is not None:
+            if args.dbsnp:
+                parser.error("--set-dbsnp cannot be combined with --dbsnp")
+            save_database("snp2pos", args.GRCh, args.set_dbsnp)
+            print("Saved snp2pos database for GRCh" + args.GRCh, file=sys.stderr)
+            return
+        dbsnp = resolve_dbsnp(args.GRCh, args.dbsnp)
+    except (OSError, ValueError, configparser.Error) as error:
+        parser.error(str(error))
+
+    if args.RS_number is not None:
+        records = snp2bed_one(args.RS_number, dbsnp)
+    else:
+        records = file2bed_tabix(args.file, dbsnp)
+
+    for record in records:
+        write_record(record, args.output, args.prefix_chr, args.bedout, args.split)
+
+    if args.time == "T":
+        t2 = time.time()
+        print("Take time: %ss" % str(t2 - t1))
+
+
+if __name__ == "__main__":
+    main()
